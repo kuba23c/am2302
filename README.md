@@ -1,2 +1,10 @@
 # am2302
-rp2350 pico2 pio + dma onewire 
+
+Example of usage PIO + DMA in RP2350 (PI PICO2) with humidity and temperature sensor AM2302.
+
+## How to run this 
+
+- clone this repo
+- open VS Code and install pico addon
+- import this project
+- compile and run

@@ -1,0 +1,158 @@
+
+/**
+ * @file am2302.h
+ * @author Jakub Czekaj (kuba23c@gmail.com)
+ * @brief PIO for AM2302 temperature and humidity sensor
+ * @version 0.1
+ * @date 2024-11-23
+ * 
+ * @copyright Copyright (c) 2024
+ * 
+ */
+
+.program am2302
+.side_set 1 pindirs
+.fifo txrx
+.in 1 left auto 8
+.out 0 right auto 32
+
+end:        
+    mov isr, null       side 0
+    irq wait 0          side 0
+
+public entry_point:
+    out x, 32           side 0      ; auto pull wait value
+loop_a:     
+    jmp x-- loop_a      side 1      ; pull down and wait 1ms
+
+    set x, 20           side 0      ; pull up      
+    jmp pin loop_l      side 0      ; if high, continue
+    jmp end             side 0      ; else, jump to end
+  
+loop_l:     
+    mov y pins          side 0      ; 20 * 10us wait time for low
+    jmp !y wait_h       side 0
+    jmp x-- loop_l      side 0  [7]
+    jmp end             side 0
+
+wait_h:     
+    set x, 9            side 0      ; 9 * 10us wait time for high
+loop_h:     
+    jmp pin wait_sl     side 0
+    jmp x-- loop_h      side 0  [8]
+    jmp end             side 0
+
+wait_sl:    
+    set x, 9            side 0      ; 9 * 10us wait time for small low 
+loop_sl:    
+    mov y pins          side 0
+    jmp !y wait_sh      side 0
+    jmp x-- loop_sl     side 0  [7]
+    jmp end             side 0
+
+.wrap_target
+wait_sh:    
+    set x, 6            side 0      ; wait 60 us for small high
+loop_sh:    
+    jmp pin read        side 0
+    jmp x-- loop_sh     side 0  [8]
+    jmp end             side 0
+
+read:       
+    set x, 3            side 0  [8]    ; wait 40us and read bit
+loop_read:  
+    jmp x-- loop_read   side 0  [9]
+    in pins 1           side 0
+    jmp pin wait_sl     side 0
+.wrap
+
+% c-sdk {
+
+#if !PICO_NO_HARDWARE
+#include "hardware/clocks.h"
+#include "hardware/dma.h"
+#endif
+//
+#define AM2302_BYTES_LEN    5
+#define AM2302_PULL_DOWN_1MS 1000
+//
+// start transfer
+static inline void am2302_start(PIO pio, uint sm, uint8_t *buffer, uint dma_channel)
+{
+    dma_channel_set_write_addr(dma_channel, buffer, false);
+    dma_channel_set_trans_count(dma_channel, AM2302_BYTES_LEN, true);
+    pio_sm_put(pio, sm, AM2302_PULL_DOWN_1MS);
+}
+//
+// clear pio interrupt
+static inline void am2302_pio_irq_clear(PIO pio){
+    pio_interrupt_clear(pio, 0);
+    irq_clear(pio_get_irq_num(pio, 0));
+}
+//
+// clear dma interrupt
+static inline void am2302_dma_irq_clear(uint dma_channel){
+    dma_channel_acknowledge_irq0(dma_channel);
+    irq_clear(DMA_IRQ_0);
+}
+//
+// dma irq 0 active and pio irq 0 active, return false on success, true on fail
+static inline bool am2302_init(PIO pio, uint sm, uint pin_num, uint dma_channel, uint8_t * buffer, uint8_t buffer_len, irq_handler_t pio_handler, irq_handler_t dma_handler){
+    if(buffer_len < AM2302_BYTES_LEN){
+        return true;
+    }
+    // new state machine config
+    pio_sm_config c = am2302_program_get_default_config(0);
+    pio_sm_claim(pio, sm);
+    //
+    // configure pins
+    pio_gpio_init(pio, pin_num);
+    sm_config_set_in_pins(&c, pin_num);
+    sm_config_set_sideset_pins(&c, pin_num);
+    sm_config_set_jmp_pin(&c, pin_num);
+    pio_sm_set_pins(pio, sm, 0);
+    //
+    // configure clock
+    float div = clock_get_hz (clk_sys) * 1e-6;
+    sm_config_set_clkdiv (&c, div);
+    //
+    // configure irq
+    pio_set_irq0_source_enabled(pio, pis_interrupt0, true);
+    irq_set_exclusive_handler(pio_get_irq_num(pio, 0), pio_handler);
+    irq_set_enabled(pio_get_irq_num(pio, 0), true);
+    //
+    // start state machine
+    if(pio_add_program_at_offset(pio, &am2302_program, 0) < 0){
+        return true;
+    }
+    if(pio_sm_init(pio, sm, am2302_offset_entry_point, &c) < 0){
+        return true;
+    }
+    pio_sm_set_enabled (pio, sm, true);
+    //
+    // configure dma
+    dma_channel_claim(dma_channel);
+    dma_channel_config dma_c = dma_channel_get_default_config(dma_channel);
+    channel_config_set_read_increment(&dma_c, false);
+    channel_config_set_write_increment(&dma_c, true);
+    channel_config_set_dreq(&dma_c, pio_get_dreq(pio, sm, false));
+    channel_config_set_chain_to(&dma_c, dma_channel);
+    channel_config_set_transfer_data_size(&dma_c, DMA_SIZE_8);
+    channel_config_set_ring(&dma_c, false, 0);
+    channel_config_set_bswap(&dma_c, false);
+    channel_config_set_irq_quiet(&dma_c, false);
+    channel_config_set_enable(&dma_c, true);
+    channel_config_set_sniff_enable(&dma_c, false);
+    channel_config_set_high_priority( &dma_c, false);
+    //
+    // configure dma irq
+    dma_irqn_set_channel_enabled(0, dma_channel, true);
+    irq_set_exclusive_handler(DMA_IRQ_0, dma_handler);
+    irq_set_enabled(DMA_IRQ_0, true);
+    //
+    // start dma
+    dma_channel_configure(dma_channel, &dma_c, buffer, pio->rxf, AM2302_BYTES_LEN, false);
+    //
+    return false;
+}
+%}
